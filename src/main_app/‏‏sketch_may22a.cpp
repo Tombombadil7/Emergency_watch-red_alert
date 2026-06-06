@@ -19,33 +19,17 @@ SemaphoreHandle_t modemInterruptSem;   // סמפור להערת משימת הה�
 
 std::atomic<bool> isCriticalSection(false); // דגל שמסמן שאין לקטוע פעולה רגישה
 std::atomic<bool> keepAwake(true);          // דגל שיקבע מתי אפשר לחזור ל-Deep Sleep
-;
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite canvas = TFT_eSprite(&tft);
-volatile bool smsPendingInterrupt = false;
+std::atomic<bool> smsPendingInterrupt{false};
+HardwareSerial SerialModem(1); // UART1
 
 // =============================================================================
 //  all global strctures and definitions
 // =============================================================================
-// 12-byte packed index record for fast binary search in geoindex.bin
-struct __attribute__((__packed__)) IndexRecord {
-    uint32_t id;
-    uint32_t offset;
-    uint32_t length;
-};
 
-struct __attribute__((packed)) emgAlertMessage {
-    // 1. First, tell the ESP32 how many IDs to expect in this specific SMS
-    uint8_t id_count; 
-    uint8_t id_count; 
-    uint32_t ids[0];  
-};
-struct MessagePacket {
-    char prefix[2];       // מחזיק "1" או "3" פלוס תו סיום מחרוזת
-    char payload[256];    // מחזיק את הנתונים הנלווים (כתובות URL וכו')
-};
 // -----------------------------------------------------------------------------
-// Pin Definitions
+// Physical Pin Definitions
 // -----------------------------------------------------------------------------
 #define MODEM_WAKEUP_PIN    12   // SIM7080G RI (Ring Indicator) pin → EXT1 wakeup
 #define BATTERY_WAKEUP_PIN  14   // Battery gauge alert pin          → EXT1 wakeup
@@ -72,20 +56,93 @@ struct MessagePacket {
 #define TFT_HEIGHT 240  // GC9A01A height
 #define TFT_ROTATION 0
 #define MODEM_APN           "iot.1nce.net"  // Replace with your SIM's APN
+// Message prefix constants
+#define MSG_EMERGENCY   '1'
+#define MSG_PRE_EMERGENCY '2'
+#define MSG_GEO_UPDATE  '3'
+#define MSG_OTA_UPDATE  '4'
+
+
+// -----------------------------------------------------------------------------
+// Global Data Structures
+// -----------------------------------------------------------------------------
+
+
+// 12-byte packed index record for fast binary search in geoindex.bin
+struct __attribute__((__packed__)) IndexRecord {
+    uint32_t id;
+    uint32_t offset;
+    uint32_t length;
+};
+
+// DownloadResult enum
+enum class DownloadResult {
+    OK,
+    INTERRUPTED,
+    ERROR
+};
+
+
+// =============================================================================
+//  MESSAGE PAYLOAD STRUCTS
+//  Rules:
+//  - Every struct must be __attribute__((packed))
+//  - Every struct must be ≤ 75 bytes (SMS budget: 140 - 1 prefix - 64 sig)
+//  - Add new struct here, then add its prefix constant and a case in MainLogicTask
+// =============================================================================
+
+
+// Type "1"/"2" — Emergency alert
+// Layout: [id_count (1 byte)] [id_0 (2 bytes)] [id_1 (2 bytes)] ... [id_N (2 bytes)]
+// Max 37 IDs (1 + 37*2 = 75 bytes)
+// areaid values from Pikud HaOref are small integers — uint16_t covers all current
+// and likely future values safely.
+struct __attribute__((packed)) EmergencyPayload {
+    uint8_t  id_count;
+    uint16_t ids[37];
+
+    // How many bytes of this struct are actually used (for validation)
+    size_t usedSize() const { return sizeof(id_count) + id_count * sizeof(uint16_t); }
+};
+
+// Type "3" — Geo file update or Type "4" — OTA update (same format, different handling)
+// Layout: two null-terminated strings packed back to back
+// e.g. "https://raw.githubusercontent.com/.../index.bin\0https://.../data.bin\0"
+struct __attribute__((packed)) UrlPayload {
+    char url[75];
+};
+
+
+
+// =============================================================================
+//  MASTER PACKET — do not modify, just add structs above and cases in MainLogicTask
+// =============================================================================
+struct __attribute__((packed)) MessagePacket {
+    uint8_t prefix;
+    union {
+        EmergencyPayload emergency;   // prefix '1'
+        GeoPayload       geo;         // prefix '3'
+        // NewTypePayload newtype;    // ← add future types here
+        uint8_t raw[75];              // hard ceiling — union is always exactly 75 bytes
+    } payload;
+};
+
+static_assert(sizeof(MessagePacket) == 76, "MessagePacket exceeds SMS budget!");
+
+
 
 const uint8_t PUBLIC_KEY[] = { 0x03, 0x5a, /* ... replace with real key bytes ... */ };
 const size_t  PUBLIC_KEY_LEN = sizeof(PUBLIC_KEY);
-String   sendAT(const String& cmd, uint32_t timeoutMs = 1000);
+String sendAT(const String& cmd, uint32_t timeoutMs = 1000);
 void     modemPowerOn();
-
 String   extractSmsBody(const String& rawAtResponse);
 bool     verify_emergency(const uint8_t* data, size_t data_len, const uint8_t* raw_sig);
-
-bool     modemHttpGetToFile(const String& url, const String& savePath);
+DownloadResult modemHttpGetToFile(const String& url, const String& savePath);
 bool     activatePDP();
 void     deactivatePDP();
-void     triggerGeoUpdate(const String& indexUrl, const String& dataUrl);
-
+void     triggerGeoUpdate(const String& baseUrl);
+void     runOneTimeDiagnostics();
+void     configureModemOnFirstBoot();
 bool     getGPSFix(float& lat, float& lon, uint32_t timeoutMs = GPS_FIX_TIMEOUT);
 void     downloadAndSaveFile(const String& savePath, uint32_t expectedBytes);
 
@@ -110,7 +167,7 @@ void setup() {
     Serial.begin(115200);
 
     // 2. יצירת אובייקטי FreeRTOS
-    emergencyQueue = xQueueCreate(5, sizeof(String)); 
+    emergencyQueue = xQueueCreate(5, sizeof(MessagePacket));
     backgroundQueue = xQueueCreate(5, sizeof(MessagePacket)); 
     uartMutex = xSemaphoreCreateRecursiveMutex(); 
     modemInterruptSem = xSemaphoreCreateBinary();
@@ -125,7 +182,8 @@ void setup() {
 }
 
 void loop() {
-    vTaskDelete(NULL); // אין צורך ב-loop
+    vTaskDelete(NULL); // ✅ נכון - אבל עדיף גם להוסיף לפניו:
+    vTaskSuspend(NULL); // כ-fallback במידה ו-FreeRTOS לא ימחק מיד
 }
 // =============================================================================
 //  Dual-task definitions: MainLogicTask + SmsListenerTask
@@ -163,38 +221,41 @@ void MainLogicTask(void *pvParameters) {
 
     while (keepAwake) {
         MessagePacket receivedMsg;
-
-        // --- תעדוף 1: בדיקת חירום (תמיד, גם אם תכף מתחיל אזור קריטי) ---
-        if (xQueueReceive(emergencyQueue, &receivedMsg, 0) == pdPASS) {
-            String prefix = String(receivedMsg.prefix);
-            if (prefix == "1") {
-                // *** יש הודעת חירום בתור! ***
-                Serial.println("[MAIN] Interrupted by Emergency from Queue!");
-                triggerEmergencyHardware(); 
-                
-                // אפשר להוסיף כאן לוגיקה שמדליקה מסך מחדש, מרעידה מנוע רטט וכו'.
-                idleStartTime = millis(); // מאפסים טיימר שינה
-            }
-        }
+        receivedMsg.prefix = (uint8_t)basePayload[0];
         
-        // --- תעדוף 2: טיפול בהודעות שגרתיות (רק אם לא באזור קריטי עכשיו) ---
+        const uint8_t* dataBytes = (const uint8_t*)basePayload.c_str() + DATA_OFFSET;
+        size_t dataLen = basePayload.length() - DATA_OFFSET;
+        
+        if (xQueueReceive(emergencyQueue, &receivedMsg, 0) == pdPASS) {
+            switch (receivedMsg.prefix) {
+                case MSG_EMERGENCY: {
+                    EmergencyPayload& e = receivedMsg.payload.emergency;
+                    triggerEmergencyalert(e.ids[],receivedMsg.prefix);
+                    // e.id_count and e.ids[] available for use
+                    break;
+                }
+            }
+            idleStartTime = millis();
+        }
         else if (!isCriticalSection) {
             if (xQueueReceive(backgroundQueue, &receivedMsg, 0) == pdPASS) {
-                String prefix = String(receivedMsg.prefix);
-                String actionData = String(receivedMsg.payload);
-                
-                if (prefix == "3") { // הודעת GEO
-                    int sep = actionData.indexOf('|');
-                    if (sep != -1) {
-                        String indexUrl = actionData.substring(0, sep);
-                        String dataUrl  = actionData.substring(sep + 1);
-                        triggerGeoUpdate(indexUrl, dataUrl); // פונקציה זו תשתמש ב-isCriticalSection וב-smsPendingInterrupt בפנים
+                switch (receivedMsg.prefix) {
+                    case MSG_GEO_UPDATE: {
+                        UrlPayload& u = receivedMsg.payload.url;
+                        triggerGeoUpdate(String(u.url));
+                        break;
+                    }
+                    case MSG_OTA_UPDATE: {
+                        UrlPayload& u = receivedMsg.payload.url;
+                        triggerOtaUpdate(String(u.url));
+                        break;
                     }
                 }
-                
-                idleStartTime = millis(); // מאפסים טיימר שינה אחרי פעולת רקע
+                idleStartTime = millis();
             }
         }
+
+    }
 
         // אם עבר זמן מסוים ללא פעילות - אפשר לחזור לישון
         if (millis() - idleStartTime > 15000) { 
@@ -226,15 +287,13 @@ void SmsListenerTask(void *pvParameters) {
                 String basePayload = extractSmsBody(rawSmsResponse);
                 
                 if (basePayload.length() > 0) {
-                    // 1. קודם מפענחים Base85 כדי שיהיה לנו תוכן לעבוד איתו
-                    String decodedSms = decodeBase85(basePayload);
-                    size_t decodedSmsLen = decodedSms.length();
+                    size_t basePayloadLen = basePayload.length();
                     
-                    // 2. חילוץ המצביעים לצורך אימות (כעת משתמשים ב-decodedSms הקיים)
-                    const uint8_t* msgBytes = (const uint8_t*)decodedSms.c_str();
+                    // 2. חילוץ המצביעים לצורך אימות (כעת משתמשים ב-basePayload הקיים)
+                    const uint8_t* msgBytes = (const uint8_t*)basePayload.c_str();
                     const uint8_t* sigBytes  = msgBytes + 1;   // 64-byte signature at offset 1
                     const uint8_t* dataBytes = msgBytes + 65;  // actual payload after signature
-                    size_t dataLen = decodedSmsLen - 65;
+                    size_t dataLen = basePayloadLen - 65;
                     
                     // 3. אימות חתימה
                     if (!verify_emergency(dataBytes, dataLen, sigBytes)) {
@@ -245,22 +304,23 @@ void SmsListenerTask(void *pvParameters) {
                     }
                     
                     // 4. חילוץ ואריזת הנתונים ל-MessagePacket
-                    String prefix = decodedSms.substring(0, 1);
-                    String actionData = decodedSms.substring(65); // שאר הנתונים (לינקים)
+                    String prefix = basePayload.substring(0, 1);
+                    String payload = basePayload.substring(66); // שאר הנתונים (לינקים)
                     
                     MessagePacket msg;
-                    strncpy(msg.prefix, prefix.c_str(), sizeof(msg.prefix) - 1);
-                    msg.prefix[sizeof(msg.prefix) - 1] = '\0';
-                    strncpy(msg.payload, actionData.c_str(), sizeof(msg.payload) - 1);
-                    msg.payload[sizeof(msg.payload) - 1] = '\0';
-                    
-                    // 5. ניתוב לתורים המתאימים לפי האפיון
-                    if (prefix == "1") {
-                        // חירום - דוחפים לתור החירום (המשימה הראשית תתפוס מיד)
+                    msg.prefix = (uint8_t)basePayload[0];
+
+                    const uint8_t* dataBytes = (const uint8_t*)basePayload.c_str() + DATA_OFFSET;
+                    size_t dataLen = basePayload.length() - DATA_OFFSET;
+
+                    if (msg.prefix == MSG_EMERGENCY || msg.prefix == MSG_PRE_EMERGENCY) {
+                        memcpy(&msg.payload.emergency, dataBytes,
+                            min(dataLen, sizeof(EmergencyPayload)));
                         xQueueSend(emergencyQueue, &msg, portMAX_DELAY);
-                    } 
-                    else if (prefix == "3") {
-                        // הוראת הורדה/רקע - מעבירים לתור המשני (המשימה הראשית תבצע כשתתפנה)
+                    }
+                    else if (msg.prefix == MSG_GEO_UPDATE) {
+                        memcpy(&msg.payload.geo, dataBytes,
+                            min(dataLen, sizeof(GeoPayload)));
                         xQueueSend(backgroundQueue, &msg, portMAX_DELAY);
                     }
                 }
@@ -452,18 +512,53 @@ cleanup:
 // =============================================================================
 //  GEO UPDATE — Download geoindex.bin + geodata.bin over cellular modem
 // =============================================================================
-void triggerGeoUpdate(const String& indexUrl, const String& dataUrl) {
-    if (!activatePDP()) return;  // Bring up data bearer
+void triggerGeoUpdate(const String& baseUrl) {
+    if (!activatePDP()) return;
 
+    if (smsPendingInterrupt) {
+        Serial.println("[GEO] Emergency pending — skipping.");
+        deactivatePDP();
+        return;
+    }
+
+    // Download both into temp files first — old files untouched until both succeed
     Serial.println("[GEO] Downloading geoindex.bin...");
-    modemHttpGetToFile(indexUrl, "/geoindex.bin");
+    DownloadResult r1 = modemHttpGetToFile(baseUrl + "geoindex.bin", "/geoindex.tmp");
+
+    if (r1 != DownloadResult::OK) {
+        Serial.println("[GEO] Index download failed/interrupted — aborting, old files intact.");
+        LittleFS.remove("/geoindex.tmp");  // clean up partial if any
+        deactivatePDP();
+        return;
+    }
+
+    if (smsPendingInterrupt) {
+        Serial.println("[GEO] Interrupted before data file — reverting.");
+        LittleFS.remove("/geoindex.tmp");
+        deactivatePDP();
+        return;
+    }
 
     Serial.println("[GEO] Downloading geodata.bin...");
-    modemHttpGetToFile(dataUrl, "/geodata.bin");
+    DownloadResult r2 = modemHttpGetToFile(baseUrl + "geodata.bin", "/geodata.tmp");
 
-    deactivatePDP();  // Release data bearer — critical for power saving
+    if (r2 != DownloadResult::OK) {
+        Serial.println("[GEO] Data download failed/interrupted — reverting, old files intact.");
+        LittleFS.remove("/geoindex.tmp");
+        LittleFS.remove("/geodata.tmp");
+        deactivatePDP();
+        return;
+    }
+
+    // Both succeeded — now atomically swap in the new files
+    LittleFS.remove("/geoindex.bin");
+    LittleFS.rename("/geoindex.tmp", "/geoindex.bin");
+    LittleFS.remove("/geodata.bin");
+    LittleFS.rename("/geodata.tmp", "/geodata.bin");
+
+    Serial.println("[GEO] Geo files updated successfully.");
+    deactivatePDP();
 }
-
 
 // =============================================================================
 //  MODEM HTTP GET → LittleFS
@@ -471,7 +566,7 @@ void triggerGeoUpdate(const String& indexUrl, const String& dataUrl) {
 //  Uses SIM7080G AT+SHTTPCREATE/CON/REQ/READ/DIS command set.
 //  Returns true on success.
 // =============================================================================
-bool modemHttpGetToFile(const String& url, const String& savePath) {
+DownloadResult modemHttpGetToFile(const String& url, const String& savePath) {
     // Parse URL: strip "https://" and split host from path
     String workUrl = url;
     bool   useHttps = workUrl.startsWith("https://");
@@ -485,7 +580,6 @@ bool modemHttpGetToFile(const String& url, const String& savePath) {
     // --- 1. Create HTTP(S) session ---
     String createCmd = useHttps ? "AT+SHTTPCREATE=\"https\"" : "AT+SHTTPCREATE=\"http\"";
     String createResp = sendAT(createCmd, 2000);
-    // Response: +SHTTPCREATE: <session_id>
     int sessionId = 0;
     int idx = createResp.indexOf("+SHTTPCREATE:");
     if (idx != -1) {
@@ -499,17 +593,16 @@ bool modemHttpGetToFile(const String& url, const String& savePath) {
     String conResp = sendAT("AT+SHTTPCON=" + String(sessionId), AT_LONG_DELAY);
     if (conResp.indexOf("OK") == -1) {
         Serial.println("[HTTP] Connection failed.");
-        return false;
+        sendAT("AT+SHTTPDIS=" + String(sessionId), 1000);
+        return DownloadResult::ERROR;
     }
 
     // --- 4. Send GET request ---
     String reqCmd = "AT+SHTTPREQ=" + String(sessionId) + ",\"GET\",\"" + reqPath + "\"";
     String reqResp = sendAT(reqCmd, AT_LONG_DELAY);
-    // Response includes +SHTTPREQ: <session>,<status_code>,<data_len>
     int dataLen = 0;
     int rIdx = reqResp.indexOf("+SHTTPREQ:");
     if (rIdx != -1) {
-        // Extract data length (3rd comma-separated field)
         String fields = reqResp.substring(rIdx + 10);
         int c1 = fields.indexOf(',');
         int c2 = (c1 != -1) ? fields.indexOf(',', c1 + 1) : -1;
@@ -521,45 +614,57 @@ bool modemHttpGetToFile(const String& url, const String& savePath) {
     if (dataLen <= 0) {
         Serial.println("[HTTP] No data in response.");
         sendAT("AT+SHTTPDIS=" + String(sessionId), 1000);
-        return false;
+        return DownloadResult::ERROR;
     }
 
     Serial.printf("[HTTP] Receiving %d bytes → %s\n", dataLen, savePath.c_str());
 
     // --- 5. Open LittleFS file for writing ---
-    if (!LittleFS.begin(false)) {
-        Serial.println("[FS] LittleFS not mounted.");
-        sendAT("AT+SHTTPDIS=" + String(sessionId), 1000);
-        return false;
-    }
     File f = LittleFS.open(savePath, FILE_WRITE);
     if (!f) {
         Serial.println("[FS] Could not open file for writing.");
         sendAT("AT+SHTTPDIS=" + String(sessionId), 1000);
-        return false;
+        return DownloadResult::ERROR;
     }
+
+    // Helper: safe abort — closes + deletes partial file, disconnects session
+    auto safeAbort = [&](DownloadResult reason) -> DownloadResult {
+        f.close();
+        LittleFS.remove(savePath);  // partial file is worse than no file
+        sendAT("AT+SHTTPDIS=" + String(sessionId), 1000);
+        Serial.printf("[HTTP] Aborted %s\n", savePath.c_str());
+        return reason;
+    };
 
     // --- 6. Read response body in 1024-byte chunks ---
     const int CHUNK = 1024;
     int bytesRead = 0;
+
     while (bytesRead < dataLen) {
+
+        // *** Emergency interrupt check — once per chunk ***
+        if (smsPendingInterrupt) {
+            Serial.println("[HTTP] Emergency interrupt — bailing download safely.");
+            return safeAbort(DownloadResult::INTERRUPTED);
+        }
+
         int toRead = min(CHUNK, dataLen - bytesRead);
-        String readCmd = "AT+SHTTPREAD=" + String(sessionId) + "," +
-                         String(bytesRead) + "," + String(toRead);
+        char readCmd[64];
+        snprintf(readCmd, sizeof(readCmd), "AT+SHTTPREAD=%d,%d,%d", sessionId, bytesRead, toRead);
         SerialModem.println(readCmd);
 
-        // Collect raw bytes from UART (skip the "+SHTTPREAD:" header line)
-        String chunk = "";
+        String chunkHeader = "";
         uint32_t dl = millis() + 3000;
         bool headerPassed = false;
+
         while (millis() < dl) {
             while (SerialModem.available()) {
                 char c = (char)SerialModem.read();
                 if (!headerPassed) {
-                    chunk += c;
-                    if (chunk.endsWith("\n") && chunk.indexOf("+SHTTPREAD:") != -1) {
+                    chunkHeader += c;
+                    if (chunkHeader.endsWith("\n") && chunkHeader.indexOf("+SHTTPREAD:") != -1) {
                         headerPassed = true;
-                        chunk = "";  // Discard header, start collecting data
+                        chunkHeader = "";
                     }
                 } else {
                     f.write((uint8_t)c);
@@ -571,13 +676,12 @@ bool modemHttpGetToFile(const String& url, const String& savePath) {
         }
     }
 
+    // --- 7. Close file and disconnect ---
     f.close();
     Serial.printf("[HTTP] Saved %d bytes to %s\n", bytesRead, savePath.c_str());
-
-    // --- 7. Disconnect session ---
     sendAT("AT+SHTTPDIS=" + String(sessionId), 1000);
 
-    return (bytesRead >= dataLen);
+    return (bytesRead >= dataLen) ? DownloadResult::OK : DownloadResult::ERROR;
 }
 
 
@@ -671,4 +775,23 @@ void handleBatteryWakeup() {
     // For now, short vibration pulse to warn user
     Serial.println("[BATTERY] Low battery warning.");
      // Reuse vibration — distinguish by pattern later
+}
+
+String sendAT(const String& cmd, uint32_t timeoutMs) {
+    if (xSemaphoreTakeRecursive(uartMutex, portMAX_DELAY) != pdTRUE) return "";
+
+    SerialModem.println(cmd);
+
+    String response = "";
+    uint32_t deadline = millis() + timeoutMs;
+
+    while (millis() < deadline) {
+        while (SerialModem.available()) {
+            response += (char)SerialModem.read();
+        }
+        if (response.indexOf("OK") != -1 || response.indexOf("ERROR") != -1) break;
+    }
+
+    xSemaphoreGiveRecursive(uartMutex);
+    return response;
 }
