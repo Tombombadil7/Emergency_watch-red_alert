@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "author": "Kshyhoo",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "wokwi-esp32-devkit-v1", "id": "esp", "top": 0, "left": 0, "attrs": {} },
+    { "type": "chip-gc9a01", "id": "chip1", "top": 164.22, "left": 110.4, "attrs": {} }
+  ],
+  "connections": [
+    [ "esp:TX0", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX0", "$serialMonitor:TX", "", [] ],
+    [ "esp:GND.1", "chip1:GND", "black", [ "h263.5", "v33.4" ] ],
+    [ "esp:3V3", "chip1:VCC", "red", [ "h263.5", "v33.5" ] ],
+    [ "esp:D18", "chip1:SCL", "cyan", [ "h4.3", "v119.9" ] ],
+    [ "esp:D23", "chip1:SDA", "limegreen", [ "h263.5", "v177.6" ] ],
+    [ "esp:D15", "chip1:CS", "orange", [ "h4.3", "v33.3" ] ],
+    [ "esp:D2", "chip1:DC", "blue", [ "h4.3", "v52" ] ],
+    [ "esp:D4", "chip1:RST", "white", [ "h4.3", "v72" ] ]
+  ],
+  "dependencies": {}
+}
