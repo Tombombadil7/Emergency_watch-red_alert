@@ -61,7 +61,10 @@ HardwareSerial SerialModem(1); // UART1
 #define MSG_PRE_EMERGENCY '2'
 #define MSG_GEO_UPDATE  '3'
 #define MSG_OTA_UPDATE  '4'
-
+static constexpr size_t SIG_OFFSET  = 1;       // signature starts after prefix byte
+static constexpr size_t SIG_LEN     = 64;       // ECDSA P-256 raw signature = 32 bytes r + 32 bytes s
+static constexpr size_t DATA_OFFSET = SIG_OFFSET + SIG_LEN;  // = 65
+static constexpr size_t MIN_MSG_LEN = DATA_OFFSET + 1;       // at minimum 1 byte of payload
 
 // -----------------------------------------------------------------------------
 // Global Data Structures
@@ -120,8 +123,8 @@ struct __attribute__((packed)) UrlPayload {
 struct __attribute__((packed)) MessagePacket {
     uint8_t prefix;
     union {
-        EmergencyPayload emergency;   // prefix '1'
-        GeoPayload       geo;         // prefix '3'
+        EmergencyPayload emergency;   // prefix '1'/'2'
+        UrlPayload url;         // prefix '3'/'4'
         // NewTypePayload newtype;    // ← add future types here
         uint8_t raw[75];              // hard ceiling — union is always exactly 75 bytes
     } payload;
@@ -144,7 +147,6 @@ void     triggerGeoUpdate(const String& baseUrl);
 void     runOneTimeDiagnostics();
 void     configureModemOnFirstBoot();
 bool     getGPSFix(float& lat, float& lon, uint32_t timeoutMs = GPS_FIX_TIMEOUT);
-void     downloadAndSaveFile(const String& savePath, uint32_t expectedBytes);
 
 
 // פונקציית פסיקת חומרה (ISR) - מופעלת כשהמכשיר *ער* ופין ה-RI יורד ל-LOW
@@ -221,16 +223,12 @@ void MainLogicTask(void *pvParameters) {
 
     while (keepAwake) {
         MessagePacket receivedMsg;
-        receivedMsg.prefix = (uint8_t)basePayload[0];
-        
-        const uint8_t* dataBytes = (const uint8_t*)basePayload.c_str() + DATA_OFFSET;
-        size_t dataLen = basePayload.length() - DATA_OFFSET;
-        
+                
         if (xQueueReceive(emergencyQueue, &receivedMsg, 0) == pdPASS) {
             switch (receivedMsg.prefix) {
                 case MSG_EMERGENCY: {
                     EmergencyPayload& e = receivedMsg.payload.emergency;
-                    triggerEmergencyalert(e.ids[],receivedMsg.prefix);
+                    triggerEmergencyalert(e.ids,e.id_count,receivedMsg.prefix);
                     // e.id_count and e.ids[] available for use
                     break;
                 }
@@ -262,8 +260,7 @@ void MainLogicTask(void *pvParameters) {
             keepAwake = false; // שובר את הלולאה ומוביל להרדמת המכשיר
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
+        vTaskDelay(pdMS_TO_TICKS(50)); // מנוחה קצרה כדי למנוע שימוש יתר במעבד  
 
     // --- ג. חזרה ל-Deep Sleep ---
     detachInterrupt(digitalPinToInterrupt(MODEM_WAKEUP_PIN));
@@ -286,14 +283,14 @@ void SmsListenerTask(void *pvParameters) {
                 String rawSmsResponse = sendAT("AT+CMGL=\"REC UNREAD\"", SMS_READ_TIMEOUT);
                 String basePayload = extractSmsBody(rawSmsResponse);
                 
-                if (basePayload.length() > 0) {
+                if (basePayload.length() < MIN_MSG_LEN) {
                     size_t basePayloadLen = basePayload.length();
                     
                     // 2. חילוץ המצביעים לצורך אימות (כעת משתמשים ב-basePayload הקיים)
                     const uint8_t* msgBytes = (const uint8_t*)basePayload.c_str();
                     const uint8_t* sigBytes  = msgBytes + 1;   // 64-byte signature at offset 1
-                    const uint8_t* dataBytes = msgBytes + 65;  // actual payload after signature
-                    size_t dataLen = basePayloadLen - 65;
+                    const uint8_t* dataBytes = (const uint8_t*)basePayload.c_str() + DATA_OFFSET;
+                    size_t dataLen = basePayload.length() - DATA_OFFSET - SIG_LEN;// נתוני ההודעה הם מה שמישאר אחרי חיסור האופסט והחתימה מהאורך הכולל
                     
                     // 3. אימות חתימה
                     if (!verify_emergency(dataBytes, dataLen, sigBytes)) {
@@ -309,9 +306,6 @@ void SmsListenerTask(void *pvParameters) {
                     
                     MessagePacket msg;
                     msg.prefix = (uint8_t)basePayload[0];
-
-                    const uint8_t* dataBytes = (const uint8_t*)basePayload.c_str() + DATA_OFFSET;
-                    size_t dataLen = basePayload.length() - DATA_OFFSET;
 
                     if (msg.prefix == MSG_EMERGENCY || msg.prefix == MSG_PRE_EMERGENCY) {
                         memcpy(&msg.payload.emergency, dataBytes,
