@@ -1,0 +1,17 @@
+{
+  "name": "GC9A01",
+  "author": "Kshyhoo",
+  "pins": [
+    "CS",
+    "DC",
+    "RST",
+    "SCL",
+    "SDA",
+    "VCC",
+    "GND"
+  ],
+  "display": {
+    "width": 240,
+    "height": 240
+  }
+}
