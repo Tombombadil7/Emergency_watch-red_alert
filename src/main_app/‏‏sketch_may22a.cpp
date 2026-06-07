@@ -6,10 +6,12 @@
 #include <Arduino.h>
 #include <esp_sleep.h>
 #include "LittleFS.h"
-#include "mbedtls/ecdsa.h"
 #include "mbedtls/ecp.h"
-#include "mbedtls/md.h"
+#include "mbedtls/ecdsa.h"
+#include "mbedtls/sha256.h"
+#include "mbedtls/bignum.h"
 #include <TFT_eSPI.h>
+#include <Update.h>
 
 // --- ממשקי FreeRTOS ---
 QueueHandle_t emergencyQueue;
@@ -140,14 +142,16 @@ String sendAT(const String& cmd, uint32_t timeoutMs = 1000);
 void     modemPowerOn();
 String   extractSmsBody(const String& rawAtResponse);
 bool     verify_emergency(const uint8_t* data, size_t data_len, const uint8_t* raw_sig);
-DownloadResult modemHttpGetToFile(const String& url, const String& savePath);
+bool     verifyDigest(const uint8_t* digest, const uint8_t* raw_sig);
+DownloadResult modemHttpGetToFile(const String& url, const String& savePath, int maxBytes = 0);
 bool     activatePDP();
 void     deactivatePDP();
 void     triggerGeoUpdate(const String& baseUrl);
+void     triggerOtaUpdate(const String& baseUrl)
 void     runOneTimeDiagnostics();
 void     configureModemOnFirstBoot();
 bool     getGPSFix(float& lat, float& lon, uint32_t timeoutMs = GPS_FIX_TIMEOUT);
-
+void    recoverGeoIfNeeded();
 
 // פונקציית פסיקת חומרה (ISR) - מופעלת כשהמכשיר *ער* ופין ה-RI יורד ל-LOW
 void IRAM_ATTR modemRiInterrupt() {
@@ -193,7 +197,8 @@ void loop() {
 
 void MainLogicTask(void *pvParameters) {
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-
+    LittleFS.begin();
+    recoverGeoIfNeeded();   // ← before any geo access to ensure we have the latest data
     // --- א. טיפול בהתעוררות משינה עמוקה ---
     if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) {
         // Cold Boot
@@ -457,16 +462,13 @@ String extractSmsBody(const String& rawAtResponse) {
     payload.trim();
     return payload;
 }
-// =============================================================================
-//  ECDSA P-256 SIGNATURE VERIFICATION  (mbedTLS hardware-accelerated on ESP32)
-//  data     — the message bytes to verify (payload after the signature)
-//  data_len — length of data
-//  raw_sig  — 64 raw bytes: first 32 = r, last 32 = s
-// =============================================================================
-bool verify_emergency(const uint8_t* data, size_t data_len, const uint8_t* raw_sig) {
-    mbedtls_ecp_group    group;
-    mbedtls_ecp_point    Q;
-    mbedtls_mpi          r, s;
+// ─── CORE ────────────────────────────────────────────────────────────────────
+// All verification funnels through here. Input is always a 32-byte SHA-256 digest
+// and a raw 64-byte ECDSA sig (R||S).
+bool verifyDigest(const uint8_t* digest, const uint8_t* raw_sig) {
+    mbedtls_ecp_group group;
+    mbedtls_ecp_point Q;
+    mbedtls_mpi       r, s;
 
     mbedtls_ecp_group_init(&group);
     mbedtls_ecp_point_init(&Q);
@@ -477,24 +479,8 @@ bool verify_emergency(const uint8_t* data, size_t data_len, const uint8_t* raw_s
     if (ret == 0) ret = mbedtls_ecp_point_read_binary(&group, &Q, PUBLIC_KEY, PUBLIC_KEY_LEN);
     if (ret == 0) ret = mbedtls_mpi_read_binary(&r, raw_sig,      32);
     if (ret == 0) ret = mbedtls_mpi_read_binary(&s, raw_sig + 32, 32);
+    if (ret == 0) ret = mbedtls_ecdsa_verify(&group, digest, 32, &Q, &r, &s);
 
-    if (ret != 0) goto cleanup;
-
-    {
-        // SHA-256 computed in hardware on ESP32 via mbedTLS
-        uint8_t              hash[32];
-        mbedtls_md_context_t md_ctx;
-        mbedtls_md_init(&md_ctx);
-        mbedtls_md_setup(&md_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
-        mbedtls_md_starts(&md_ctx);
-        mbedtls_md_update(&md_ctx, data, data_len);
-        mbedtls_md_finish(&md_ctx, hash);
-        mbedtls_md_free(&md_ctx);
-
-        ret = mbedtls_ecdsa_verify(&group, hash, sizeof(hash), &Q, &r, &s);
-    }
-
-cleanup:
     mbedtls_ecp_group_free(&group);
     mbedtls_ecp_point_free(&Q);
     mbedtls_mpi_free(&r);
@@ -503,25 +489,80 @@ cleanup:
     return (ret == 0);
 }
 
+// ─── WRAPPER 1: SMS ───────────────────────────────────────────────────────────
+bool verify_emergency(const uint8_t* data, size_t data_len, const uint8_t* raw_sig) {
+    uint8_t hash[32];
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+    mbedtls_md_starts(&ctx);
+    mbedtls_md_update(&ctx, data, data_len);
+    mbedtls_md_finish(&ctx, hash);
+    mbedtls_md_free(&ctx);
+
+    return verifyDigest(hash, raw_sig);
+}
+
+// ─── WRAPPER 2: Files (OTA = 1 file, Geo = 2 files) ──────────────────────────
+// Pass nullptr for path2 when verifying a single file.
+bool verifyFiles(const char* path1, const char* path2, const char* sigPath) {
+    // 1. Hash the file(s) — same SHA context, fed sequentially
+    uint8_t hash[32];
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+    mbedtls_md_starts(&ctx);
+
+    auto feedFile = [&](const char* path) -> bool {
+        File f = LittleFS.open(path, FILE_READ);
+        if (!f) { Serial.printf("[VERIFY] Cannot open %s\n", path); return false; }
+        uint8_t buf[256];
+        while (f.available()) {
+            int n = f.read(buf, sizeof(buf));
+            mbedtls_md_update(&ctx, buf, n);
+        }
+        f.close();
+        return true;
+    };
+
+    bool ok = feedFile(path1) && (path2 == nullptr || feedFile(path2));
+    mbedtls_md_finish(&ctx, hash);
+    mbedtls_md_free(&ctx);
+
+    if (!ok) return false;
+
+    // 2. Load the .sig file (must be exactly 64 bytes)
+    File sf = LittleFS.open(sigPath, FILE_READ);
+    if (!sf || sf.size() != 64) {
+        Serial.printf("[VERIFY] Bad sig file: %s\n", sigPath);
+        if (sf) sf.close();
+        return false;
+    }
+    uint8_t raw_sig[64];
+    sf.read(raw_sig, 64);
+    sf.close();
+
+    return verifyDigest(hash, raw_sig);
+}
+
 // =============================================================================
-//  GEO UPDATE — Download geoindex.bin + geodata.bin over cellular modem
+//  GEO UPDATE — Download geoindex.bin + geodata.bin + geo.sig over cellular modem
 // =============================================================================
 void triggerGeoUpdate(const String& baseUrl) {
     if (!activatePDP()) return;
-
     if (smsPendingInterrupt) {
         Serial.println("[GEO] Emergency pending — skipping.");
         deactivatePDP();
         return;
     }
 
-    // Download both into temp files first — old files untouched until both succeed
+    // --- 1. Download index ---
     Serial.println("[GEO] Downloading geoindex.bin...");
-    DownloadResult r1 = modemHttpGetToFile(baseUrl + "geoindex.bin", "/geoindex.tmp");
-
-    if (r1 != DownloadResult::OK) {
-        Serial.println("[GEO] Index download failed/interrupted — aborting, old files intact.");
-        LittleFS.remove("/geoindex.tmp");  // clean up partial if any
+    if (modemHttpGetToFile(baseUrl + "geoindex.bin", "/geoindex.tmp") != DownloadResult::OK) {
+        Serial.println("[GEO] Index download failed — aborting, old files intact.");
+        LittleFS.remove("/geoindex.tmp");
+        LittleFS.remove("/geodata.tmp");
+        LittleFS.remove("/geo.sig.tmp");
         deactivatePDP();
         return;
     }
@@ -529,29 +570,102 @@ void triggerGeoUpdate(const String& baseUrl) {
     if (smsPendingInterrupt) {
         Serial.println("[GEO] Interrupted before data file — reverting.");
         LittleFS.remove("/geoindex.tmp");
+        LittleFS.remove("/geodata.tmp");
+        LittleFS.remove("/geo.sig.tmp");
         deactivatePDP();
         return;
     }
 
+    // --- 2. Download data ---
     Serial.println("[GEO] Downloading geodata.bin...");
-    DownloadResult r2 = modemHttpGetToFile(baseUrl + "geodata.bin", "/geodata.tmp");
-
-    if (r2 != DownloadResult::OK) {
-        Serial.println("[GEO] Data download failed/interrupted — reverting, old files intact.");
+    if (modemHttpGetToFile(baseUrl + "geodata.bin", "/geodata.tmp") != DownloadResult::OK) {
+        Serial.println("[GEO] Data download failed — reverting, old files intact.");
         LittleFS.remove("/geoindex.tmp");
         LittleFS.remove("/geodata.tmp");
+        LittleFS.remove("/geo.sig.tmp");
         deactivatePDP();
         return;
     }
 
-    // Both succeeded — now atomically swap in the new files
-    LittleFS.remove("/geoindex.bin");
-    LittleFS.rename("/geoindex.tmp", "/geoindex.bin");
-    LittleFS.remove("/geodata.bin");
-    LittleFS.rename("/geodata.tmp", "/geodata.bin");
+    if (smsPendingInterrupt) {
+        Serial.println("[GEO] Interrupted before sig file — reverting.");
+        LittleFS.remove("/geoindex.tmp");
+        LittleFS.remove("/geodata.tmp");
+        LittleFS.remove("/geo.sig.tmp");
+        deactivatePDP();
+        return;
+    }
 
-    Serial.println("[GEO] Geo files updated successfully.");
+    // --- 3. Download signature into a temp name so the live .sig is untouched until verified ---
+    Serial.println("[GEO] Downloading geo.sig...");
+    if (modemHttpGetToFile(baseUrl + "geo.sig", "/geo.sig.tmp") != DownloadResult::OK) {
+        Serial.println("[GEO] Sig download failed — reverting, old files intact.");
+        LittleFS.remove("/geoindex.tmp");
+        LittleFS.remove("/geodata.tmp");
+        LittleFS.remove("/geo.sig.tmp");
+        deactivatePDP();
+        return;
+    }
+
+    // --- 4. Verify before touching any live files ---
+    if (!verifyFiles("/geoindex.tmp", "/geodata.tmp", "/geo.sig.tmp")) {
+        Serial.println("[GEO] Signature verification failed — old files intact.");
+        LittleFS.remove("/geoindex.tmp");
+        LittleFS.remove("/geodata.tmp");
+        LittleFS.remove("/geo.sig.tmp");
+        deactivatePDP();
+        return;
+    }
+
+    // --- 5. Atomic swap: backup live → rename tmp → remove backup ---
+    // If power dies after backup but before rename, the backup file is still valid.
+    // If power dies after rename, the new file is already in place.
+    // Either way, at least one complete copy of the data always exists on disk.
+    LittleFS.rename("/geoindex.bin", "/geoindex.bak");
+    LittleFS.rename("/geoindex.tmp", "/geoindex.bin");
+    LittleFS.remove("/geoindex.bak");
+
+    LittleFS.rename("/geodata.bin", "/geodata.bak");
+    LittleFS.rename("/geodata.tmp", "/geodata.bin");
+    LittleFS.remove("/geodata.bak");
+
+    // Keep geo.sig.tmp → geo.sig for cold-boot integrity verification
+    LittleFS.rename("/geo.sig", "/geo.sig.bak");
+    LittleFS.rename("/geo.sig.tmp", "/geo.sig");
+    LittleFS.remove("/geo.sig.bak");
+
+    Serial.println("[GEO] Geo files updated and verified successfully.");
     deactivatePDP();
+}
+
+// =============================================================================
+//  GEO RECOVERY — Call once at boot before any geo data is accessed
+// =============================================================================
+void recoverGeoIfNeeded() {
+    // A .bak file means power died mid-swap.
+    // The .tmp was not yet renamed, so .bak is the last known-good copy.
+    // Restore it back to the live name.
+
+    if (LittleFS.exists("/geoindex.bak")) {
+        Serial.println("[GEO] Recovering geoindex from backup...");
+        LittleFS.remove("/geoindex.bin");       // may be absent or partial
+        LittleFS.rename("/geoindex.bak", "/geoindex.bin");
+        LittleFS.remove("/geoindex.tmp");        // partial download, discard
+    }
+
+    if (LittleFS.exists("/geodata.bak")) {
+        Serial.println("[GEO] Recovering geodata from backup...");
+        LittleFS.remove("/geodata.bin");
+        LittleFS.rename("/geodata.bak", "/geodata.bin");
+        LittleFS.remove("/geodata.tmp");
+    }
+
+    if (LittleFS.exists("/geo.sig.bak")) {
+        Serial.println("[GEO] Recovering geo.sig from backup...");
+        LittleFS.remove("/geo.sig");
+        LittleFS.rename("/geo.sig.bak", "/geo.sig");
+        LittleFS.remove("/geo.sig.tmp");
+    }
 }
 
 // =============================================================================
@@ -560,7 +674,7 @@ void triggerGeoUpdate(const String& baseUrl) {
 //  Uses SIM7080G AT+SHTTPCREATE/CON/REQ/READ/DIS command set.
 //  Returns true on success.
 // =============================================================================
-DownloadResult modemHttpGetToFile(const String& url, const String& savePath) {
+DownloadResult modemHttpGetToFile(const String& url, const String& savePath, int maxBytes = 0) {
     // Parse URL: strip "https://" and split host from path
     String workUrl = url;
     bool   useHttps = workUrl.startsWith("https://");
@@ -604,9 +718,16 @@ DownloadResult modemHttpGetToFile(const String& url, const String& savePath) {
             dataLen = fields.substring(c2 + 1).toInt();
         }
     }
-
+    
     if (dataLen <= 0) {
         Serial.println("[HTTP] No data in response.");
+        sendAT("AT+SHTTPDIS=" + String(sessionId), 1000);
+        return DownloadResult::ERROR;
+    }
+    
+    // *** Size cap — reject oversized responses before touching the filesystem ***
+    if (maxBytes > 0 && dataLen > maxBytes) {
+        Serial.printf("[HTTP] Response too large (%d bytes, cap %d) — aborting.\n", dataLen, maxBytes);
         sendAT("AT+SHTTPDIS=" + String(sessionId), 1000);
         return DownloadResult::ERROR;
     }
@@ -788,4 +909,123 @@ String sendAT(const String& cmd, uint32_t timeoutMs) {
 
     xSemaphoreGiveRecursive(uartMutex);
     return response;
+}
+
+// =============================================================================
+//  OTA UPDATE — Download firmware.bin + firmware.sig over cellular modem
+// =============================================================================
+
+// Minimum and maximum accepted firmware sizes — tune to your actual firmware
+static constexpr size_t OTA_MIN_FIRMWARE_BYTES = 100  * 1024;  // 100 KB
+static constexpr size_t OTA_MAX_FIRMWARE_BYTES = 1500 * 1024;  // 1.5 MB
+
+void triggerOtaUpdate(const String& baseUrl) {
+    if (!activatePDP()) return;
+    if (smsPendingInterrupt) {
+        Serial.println("[OTA] Emergency pending — skipping.");
+        deactivatePDP();
+        return;
+    }
+
+    // --- 0. Ensure enough LittleFS space before downloading anything ---
+    size_t fsFree = LittleFS.totalBytes() - LittleFS.usedBytes();
+    if (fsFree < OTA_MAX_FIRMWARE_BYTES) {
+        Serial.printf("[OTA] Not enough LittleFS space (%u free) — aborting.\n", fsFree);
+        deactivatePDP();
+        return;
+    }
+
+    // --- 1. Download firmware ---
+    Serial.println("[OTA] Downloading firmware.bin...");
+    DownloadResult dr = modemHttpGetToFile(baseUrl + "firmware.bin", "/firmware.tmp",
+                                           OTA_MAX_FIRMWARE_BYTES); // ← pass size cap
+    if (dr != DownloadResult::OK) {
+        Serial.println("[OTA] Firmware download failed — aborting.");
+        LittleFS.remove("/firmware.tmp");
+        LittleFS.remove("/firmware.sig.tmp");
+        deactivatePDP();
+        return;
+    }
+
+    if (smsPendingInterrupt) {
+        Serial.println("[OTA] Interrupted before sig file — reverting.");
+        LittleFS.remove("/firmware.tmp");
+        LittleFS.remove("/firmware.sig.tmp");
+        deactivatePDP();
+        return;
+    }
+
+    // --- 2. Sanity-check firmware size before even fetching the sig ---
+    size_t firmwareSize = LittleFS.open("/firmware.tmp", FILE_READ).size();
+    if (firmwareSize < OTA_MIN_FIRMWARE_BYTES || firmwareSize > OTA_MAX_FIRMWARE_BYTES) {
+        Serial.printf("[OTA] Firmware size %u bytes out of bounds — aborting.\n", firmwareSize);
+        LittleFS.remove("/firmware.tmp");
+        LittleFS.remove("/firmware.sig.tmp");
+        deactivatePDP();
+        return;
+    }
+
+    // --- 3. Download signature ---
+    Serial.println("[OTA] Downloading firmware.sig...");
+    if (modemHttpGetToFile(baseUrl + "firmware.sig", "/firmware.sig.tmp") != DownloadResult::OK) {
+        Serial.println("[OTA] Sig download failed — aborting.");
+        LittleFS.remove("/firmware.tmp");
+        LittleFS.remove("/firmware.sig.tmp");
+        deactivatePDP();
+        return;
+    }
+
+    // --- 4. Verify signature ---
+    if (!verifyFiles("/firmware.tmp", nullptr, "/firmware.sig.tmp")) {
+        Serial.println("[OTA] Signature verification failed — aborting, device untouched.");
+        LittleFS.remove("/firmware.tmp");
+        LittleFS.remove("/firmware.sig.tmp");
+        deactivatePDP();
+        return;
+    }
+    LittleFS.remove("/firmware.sig.tmp");
+
+    // --- 5. Final emergency check before we commit to flashing ---
+    if (smsPendingInterrupt) {
+        Serial.println("[OTA] Emergency arrived after verification — aborting flash.");
+        LittleFS.remove("/firmware.tmp");
+        deactivatePDP();
+        return;
+    }
+
+    // --- 6. Flash ---
+    Serial.println("[OTA] Signature OK — flashing...");
+    deactivatePDP(); // release modem before flashing
+
+    File f = LittleFS.open("/firmware.tmp", FILE_READ);
+    if (!f) {
+        Serial.println("[OTA] Could not open firmware for flashing.");
+        LittleFS.remove("/firmware.tmp");
+        return;
+    }
+
+    size_t flashSize = f.size();
+
+    if (!Update.begin(flashSize)) {
+        Serial.printf("[OTA] Update.begin() failed — partition too small for %u bytes?\n", flashSize);
+        f.close();
+        LittleFS.remove("/firmware.tmp");
+        return;
+    }
+
+    size_t written = Update.writeStream(f);
+    f.close();
+
+    // Cross-check written bytes against what we expected
+    if (written != flashSize || !Update.end() || !Update.isFinished()) {
+        Serial.printf("[OTA] Flash incomplete — wrote %u of %u bytes. Rolling back.\n",
+                      written, flashSize);
+        Update.abort();
+        LittleFS.remove("/firmware.tmp");
+        return;
+    }
+
+    LittleFS.remove("/firmware.tmp");
+    Serial.println("[OTA] Flash complete — rebooting.");
+    ESP.restart();
 }
