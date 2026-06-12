@@ -1,4 +1,6 @@
+#include <TFT_eSPI.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/timers.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
@@ -10,8 +12,9 @@
 #include "mbedtls/ecdsa.h"
 #include "mbedtls/sha256.h"
 #include "mbedtls/bignum.h"
-#include <TFT_eSPI.h>
 #include <Update.h>
+#include <math.h>
+#include <string.h>
 
 // --- ממשקי FreeRTOS ---
 QueueHandle_t emergencyQueue;
@@ -58,6 +61,8 @@ HardwareSerial SerialModem(1); // UART1
 #define TFT_HEIGHT 240  // GC9A01A height
 #define TFT_ROTATION 0
 #define MODEM_APN           "iot.1nce.net"  // Replace with your SIM's APN
+
+
 // Message prefix constants
 #define MSG_EMERGENCY   '1'
 #define MSG_PRE_EMERGENCY '2'
@@ -67,7 +72,20 @@ static constexpr size_t SIG_OFFSET  = 1;       // signature starts after prefix 
 static constexpr size_t SIG_LEN     = 64;       // ECDSA P-256 raw signature = 32 bytes r + 32 bytes s
 static constexpr size_t DATA_OFFSET = SIG_OFFSET + SIG_LEN;  // = 65
 static constexpr size_t MIN_MSG_LEN = DATA_OFFSET + 1;       // at minimum 1 byte of payload
+static constexpr uint32_t ANIM_INTERVAL_MS = 20;
+static constexpr uint16_t CENTER_X         = 120;
+static constexpr uint16_t CENTER_Y         = 140;
 
+static TFT_eSPI*    s_tft    = nullptr;
+static TFT_eSprite* s_sprite = nullptr;
+static TimerHandle_t s_timer = nullptr;
+static AnimMode     s_mode   = AnimMode::PULSE_RING;
+static uint32_t     s_phase  = 0;
+
+RTC_DATA_ATTR time_t lastgpsfixRun = 0;
+RTC_DATA_ATTR float  lastKnownLat   = 0.0f;    
+RTC_DATA_ATTR float  lastKnownLon   = 0.0f;
+RTC_DATA_ATTR bool   lastKnownValid = false;
 // -----------------------------------------------------------------------------
 // Global Data Structures
 // -----------------------------------------------------------------------------
@@ -87,6 +105,10 @@ enum class DownloadResult {
     ERROR
 };
 
+enum class AnimMode {
+    PULSE_RING,
+    SPINNING_ARC,
+};
 
 // =============================================================================
 //  MESSAGE PAYLOAD STRUCTS
@@ -150,8 +172,14 @@ void     triggerGeoUpdate(const String& baseUrl);
 void     triggerOtaUpdate(const String& baseUrl)
 void     runOneTimeDiagnostics();
 void     configureModemOnFirstBoot();
-bool     getGPSFix(float& lat, float& lon, uint32_t timeoutMs = GPS_FIX_TIMEOUT);
+bool     bool getGPSFix(float& lat, float& lon, bool forceFresh = false, uint32_t timeoutMs = GPS_FIX_TIMEOUT);;
 void    recoverGeoIfNeeded();
+void    initAnimationTimer(TFT_eSPI* tft, TFT_eSprite* sprite);
+void    startAnimation(AnimMode mode = AnimMode::PULSE_RING);
+void    stopAnimation();
+void    updateAnimationText(const char* text, uint16_t x, uint16_t y, uint8_t size = 1);
+bool    syncTimeFromModem();
+void    esp_deep_sleep_start();
 
 // פונקציית פסיקת חומרה (ISR) - מופעלת כשהמכשיר *ער* ופין ה-RI יורד ל-LOW
 void IRAM_ATTR modemRiInterrupt() {
@@ -183,7 +211,8 @@ void setup() {
     xTaskCreatePinnedToCore(SmsListenerTask, "SMS_Task", 8192, NULL, 3, NULL, 0);
     // המשימה הראשית (לוגיקה) על ליבה 1
     xTaskCreatePinnedToCore(MainLogicTask, "Main_Task", 16384, NULL, 1, NULL, 1);
-
+    // pass references to TFT and Sprite for animation timer
+    initAnimationTimer(&tft, &canvas);
     // ה-Scheduler מתחיל לעבוד אוטומטית, פונקציית setup מסתיימת.
 }
 
@@ -205,6 +234,7 @@ void MainLogicTask(void *pvParameters) {
         Serial.println("[BOOT] Cold boot...");
         runOneTimeDiagnostics();
         configureModemOnFirstBoot();
+        syncTimeFromModem();
     } 
     else if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
         uint64_t wakeup_pin_mask = esp_sleep_get_ext1_wakeup_status();
@@ -215,6 +245,7 @@ void MainLogicTask(void *pvParameters) {
             xSemaphoreGive(modemInterruptSem);
         } 
         else if (wakeup_pin_mask & (1ULL << BATTERY_WAKEUP_PIN)) {
+            syncTimeFromModem();
             handleBatteryWakeup(); 
         }
     }
@@ -241,6 +272,7 @@ void MainLogicTask(void *pvParameters) {
             idleStartTime = millis();
         }
         else if (!isCriticalSection) {
+            syncTimeFromModem();
             if (xQueueReceive(backgroundQueue, &receivedMsg, 0) == pdPASS) {
                 switch (receivedMsg.prefix) {
                     case MSG_GEO_UPDATE: {
@@ -269,8 +301,7 @@ void MainLogicTask(void *pvParameters) {
 
     // --- ג. חזרה ל-Deep Sleep ---
     detachInterrupt(digitalPinToInterrupt(MODEM_WAKEUP_PIN));
-    prepareForSleep(); // פונקציה שמרכזת את כיבוי המסך (0x10), הגדרת פינים ל-Wakeup, והפעלת esp_deep_sleep_start()
-}
+    prepareForSleep(); 
 
 void SmsListenerTask(void *pvParameters) {
     while (true) {
@@ -826,7 +857,17 @@ void deactivatePDP() {
 //  With A-GPS and a clear view, fix should arrive in < 2 seconds.
 //  lat and lon are filled on success. Returns false on timeout.
 // =============================================================================
-bool getGPSFix(float& lat, float& lon, uint32_t timeoutMs) {
+bool getGPSFix(float& lat, float& lon, bool forceFresh = false, uint32_t timeoutMs = GPS_FIX_TIMEOUT) {
+    time_t now; time(&now);
+    int age = (int)(now - lastgpsfixRun);
+
+    if (!forceFresh && lastKnownValid && age < 60) {
+        lat = lastKnownLat;
+        lon = lastKnownLon;
+        Serial.printf("[GPS] Cached fix, %ds old.\n", age);
+        return true;
+    }
+
     sendAT("AT+CGNSSPWR=1", 1000);   // Power on GNSS engine
     delay(500);
 
@@ -867,6 +908,10 @@ bool getGPSFix(float& lat, float& lon, uint32_t timeoutMs) {
     }
 
     sendAT("AT+CGNSSPWR=0", 500);  // Power off GNSS immediately — saves ~30mA
+    lastgpsfixRun  = now;
+    lastKnownLat   = lat;
+    lastKnownLon   = lon;
+    lastKnownValid = true;
     return fixFound;
 }
 
@@ -1028,4 +1073,130 @@ void triggerOtaUpdate(const String& baseUrl) {
     LittleFS.remove("/firmware.tmp");
     Serial.println("[OTA] Flash complete — rebooting.");
     ESP.restart();
+}
+bool syncTimeFromModem() {
+    String resp = sendAT("AT+CCLK?", 1000);
+    int idx = resp.indexOf("+CCLK: \"");
+    if (idx == -1) {
+        Serial.println("[TIME] CCLK no response.");
+        return false;
+    }
+
+    struct tm t = {};
+    int tz_offset_quarters = 0;
+    String ts = resp.substring(idx + 8);
+    if (sscanf(ts.c_str(), "%d/%d/%d,%d:%d:%d%d",
+               &t.tm_year, &t.tm_mon,  &t.tm_mday,
+               &t.tm_hour, &t.tm_min,  &t.tm_sec,
+               &tz_offset_quarters) < 6) {
+        Serial.println("[TIME] CCLK parse failed.");
+        return false;
+    }
+
+    t.tm_year += 100;
+    t.tm_mon  -= 1;
+    t.tm_isdst = -1;
+
+    time_t utc_epoch = mktime(&t) - (tz_offset_quarters * 15 * 60);
+    struct timeval tv = { .tv_sec = utc_epoch, .tv_usec = 0 };
+    settimeofday(&tv, nullptr);
+
+    Serial.printf("[TIME] Synced — UTC epoch %lu.\n", (unsigned long)utc_epoch);
+    return true;
+}
+// =============================================================================
+//  animation maneger — simple timer-driven animations on the TFT display
+// =============================================================================
+
+// ── Callback ─────────────────────────────────────────────────────
+
+static void animationTimerCallback(TimerHandle_t) {
+    if (!s_sprite) return;
+
+    s_phase++;
+    s_sprite->fillSprite(TFT_BLACK);
+
+    switch (s_mode) {
+        case AnimMode::PULSE_RING:
+            
+        static const uint8_t motorPattern[] = {1,1,0,1,1,0,0,0,1,1,1,1,0,0,0,0};
+            digitalWrite(MOTOR_PIN, motorPattern[s_phase % sizeof(motorPattern)]);
+
+            //animation sequense - s_phase goes from 0 to 15, creating a 16-step loop that change every 20ms (ANIM_INTERVAL_MS)
+            uint16_t radius = 40 + (uint8_t)(6.0f * sinf(s_phase * 0.08f));
+            s_sprite->drawCircle(CENTER_X, CENTER_Y, radius,     TFT_WHITE);
+            s_sprite->drawCircle(CENTER_X, CENTER_Y, radius - 1, TFT_WHITE);
+
+            updateAnimationText("Connecting...", CENTER_X, CENTER_Y + 60);
+            break;
+
+        case AnimMode::SPINNING_ARC:
+            uint16_t startAngle = (s_phase * 6) % 360;
+            s_sprite->drawArc(CENTER_X, CENTER_Y, 40, 34, startAngle, startAngle + 270, TFT_GREEN, TFT_BLACK);
+            updateAnimationText("Registering...", CENTER_X, CENTER_Y + 60);
+            break;
+    }
+
+    s_sprite->pushSprite(0, 0);
+}
+
+// ── Public API ───────────────────────────────────────────────────
+
+void initAnimationTimer(TFT_eSPI* tft, TFT_eSprite* sprite) {
+    s_tft    = tft;
+    s_sprite = sprite;
+
+    s_timer = xTimerCreate(
+        "AnimTimer",
+        pdMS_TO_TICKS(ANIM_INTERVAL_MS),
+        pdTRUE,
+        nullptr,
+        animationTimerCallback
+    );
+    configASSERT(s_timer != nullptr);
+}
+
+void startAnimation(AnimMode mode) {
+    s_mode  = mode;
+    s_phase = 0;
+    if (s_timer) xTimerStart(s_timer, 0);
+}
+
+void stopAnimation() {
+    if (s_timer) xTimerStop(s_timer, 0);
+}
+
+void updateAnimationText(const char* text, uint16_t x, uint16_t y, uint8_t size = 1) {
+    s_sprite->setTextDatum(MC_DATUM);
+    s_sprite->setTextSize(size);
+    s_sprite->setTextColor(TFT_WHITE, TFT_BLACK);
+    s_sprite->drawString(text, x, y);
+}
+
+
+void prepareForSleep() {
+    Serial.println("[SLEEP] Preparing for deep sleep...");
+
+    syncTimeFromModem();
+
+    stopAnimation();
+    canvas.fillSprite(TFT_BLACK);
+    canvas.pushSprite(0, 0);
+    digitalWrite(BACKLIGHT_PIN, LOW);
+
+    SerialModem.flush();
+
+    deactivatePDP();
+
+    sendAT("AT+CSCLK=1",        500);
+    sendAT("AT+CNMI=2,1,0,0,0", 500);
+
+    esp_sleep_enable_ext1_wakeup(
+        (1ULL << MODEM_WAKEUP_PIN) | (1ULL << BATTERY_WAKEUP_PIN),
+        ESP_EXT1_WAKEUP_ANY_LOW
+    );
+
+    Serial.println("[SLEEP] Entering deep sleep.");
+    Serial.flush();
+    esp_deep_sleep_start();
 }
