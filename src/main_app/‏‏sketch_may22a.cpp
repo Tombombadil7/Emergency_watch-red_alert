@@ -42,6 +42,7 @@ HardwareSerial SerialModem(1); // UART1
 #define MODEM_TX_PIN        17   // ESP32 TX → SIM7080G RX
 #define MODEM_PWRKEY_PIN    4    // SIM7080G PWRKEY — pulse LOW 1.5s to toggle power
 #define BACKLIGHT_PIN 5
+#define USB_DETECT_PIN  34
 //TFT library defied pins (not in code, just here for documentation): 
 //#define TFT_MOSI 23
 //#define TFT_SCLK 18
@@ -79,7 +80,7 @@ static constexpr uint16_t CENTER_Y         = 140;
 static TFT_eSPI*    s_tft    = nullptr;
 static TFT_eSprite* s_sprite = nullptr;
 static TimerHandle_t s_timer = nullptr;
-static AnimMode     s_mode   = AnimMode::PULSE_RING;
+static AnimMode     s_mode   = AnimMode::Initialization;
 static uint32_t     s_phase  = 0;
 
 RTC_DATA_ATTR time_t lastgpsfixRun = 0;
@@ -106,8 +107,11 @@ enum class DownloadResult {
 };
 
 enum class AnimMode {
-    PULSE_RING,
-    SPINNING_ARC,
+    Alert1,
+    Alert2,
+    Initialization,
+    Maintenance,
+    Need_charging,
 };
 
 // =============================================================================
@@ -172,14 +176,15 @@ void     triggerGeoUpdate(const String& baseUrl);
 void     triggerOtaUpdate(const String& baseUrl)
 void     runOneTimeDiagnostics();
 void     configureModemOnFirstBoot();
-bool     bool getGPSFix(float& lat, float& lon, bool forceFresh = false, uint32_t timeoutMs = GPS_FIX_TIMEOUT);;
+bool    getGPSFix(float& lat, float& lon, bool forceFresh = false, uint32_t timeoutMs = GPS_FIX_TIMEOUT);;
 void    recoverGeoIfNeeded();
 void    initAnimationTimer(TFT_eSPI* tft, TFT_eSprite* sprite);
 void    startAnimation(AnimMode mode = AnimMode::PULSE_RING);
 void    stopAnimation();
 void    updateAnimationText(const char* text, uint16_t x, uint16_t y, uint8_t size = 1);
 bool    syncTimeFromModem();
-void    esp_deep_sleep_start();
+void handleBatteryWakeup();
+void prepareForSleep();
 
 // פונקציית פסיקת חומרה (ISR) - מופעלת כשהמכשיר *ער* ופין ה-RI יורד ל-LOW
 void IRAM_ATTR modemRiInterrupt() {
@@ -333,7 +338,6 @@ void SmsListenerTask(void *pvParameters) {
                         // Signature mismatch — discard silently
                         sendAT("AT+CMGD=1,4", 500);
                         xSemaphoreGiveRecursive(uartMutex);
-                        continue; // חוזר לתחילת הלולאה להמתין לסמפור הבא
                     }
                     
                     // 4. חילוץ ואריזת הנתונים ל-MessagePacket
@@ -392,6 +396,7 @@ void runOneTimeDiagnostics() {
                   ESP.getChipModel(), ESP.getChipCores(), ESP.getCpuFreqMHz());
     Serial.printf("[DIAG] Free heap: %u bytes\n", ESP.getFreeHeap());
 }
+
 // =============================================================================
 //  COLD BOOT — One-time modem initialisation
 // =============================================================================
@@ -860,7 +865,6 @@ void deactivatePDP() {
 bool getGPSFix(float& lat, float& lon, bool forceFresh = false, uint32_t timeoutMs = GPS_FIX_TIMEOUT) {
     time_t now; time(&now);
     int age = (int)(now - lastgpsfixRun);
-
     if (!forceFresh && lastKnownValid && age < 60) {
         lat = lastKnownLat;
         lon = lastKnownLon;
@@ -868,7 +872,7 @@ bool getGPSFix(float& lat, float& lon, bool forceFresh = false, uint32_t timeout
         return true;
     }
 
-    sendAT("AT+CGNSSPWR=1", 1000);   // Power on GNSS engine
+    sendAT("AT+CGNSSPWR=1", 1000);
     delay(500);
 
     bool fixFound = false;
@@ -876,14 +880,9 @@ bool getGPSFix(float& lat, float& lon, bool forceFresh = false, uint32_t timeout
 
     while (millis() < deadline) {
         String info = sendAT("AT+CGNSSINFO", 1000);
-        // Response: +CGNSSINFO: <mode>,<GPS satellites used>,<GNSS satellites used>,
-        //           <GLONASS satellites used>,<date>,<UTC time>,<lat>,<lat dir>,
-        //           <lon>,<lon dir>,<alt>,<speed>,<course>,<PDOP>,<HDOP>,<VDOP>
         int infoIdx = info.indexOf("+CGNSSINFO:");
         if (infoIdx != -1) {
-            // A fix is valid when field 6 (lat) is non-empty
             String fields = info.substring(infoIdx + 12);
-            // Split CSV
             String parts[16];
             int partIdx = 0;
             int start = 0;
@@ -893,11 +892,9 @@ bool getGPSFix(float& lat, float& lon, bool forceFresh = false, uint32_t timeout
                     start = i + 1;
                 }
             }
-            // parts[6] = latitude, parts[8] = longitude (if non-empty, fix acquired)
             if (parts[6].length() > 0 && parts[6] != "0") {
                 lat = parts[6].toFloat();
                 lon = parts[8].toFloat();
-                // Handle Southern / Western hemispheres
                 if (parts[7] == "S") lat = -lat;
                 if (parts[9] == "W") lon = -lon;
                 fixFound = true;
@@ -907,34 +904,43 @@ bool getGPSFix(float& lat, float& lon, bool forceFresh = false, uint32_t timeout
         delay(200);
     }
 
-    sendAT("AT+CGNSSPWR=0", 500);  // Power off GNSS immediately — saves ~30mA
-    lastgpsfixRun  = now;
-    lastKnownLat   = lat;
-    lastKnownLon   = lon;
-    lastKnownValid = true;
+    sendAT("AT+CGNSSPWR=0", 500);
+    lastgpsfixRun = now;
+    if (fixFound) {
+        lastKnownLat   = lat;
+        lastKnownLon   = lon;
+        lastKnownValid = true;
+    }
     return fixFound;
 }
 
-
-// =============================================================================
-//  EMERGENCY HARDWARE TRIGGER — Vibration motor + any future alert output
-// =============================================================================
-void triggerEmergencyHardware() {
-    // TODO: drive MOSFET gate pin controlling the LRA/coin vibration motor
-    // e.g.: digitalWrite(VIBRATION_MOSFET_PIN, HIGH); delay(500); ...
-    // Placeholder:
-    Serial.println("[ALERT] EMERGENCY TRIGGERED — vibration motor should fire here.");
-}
 
 
 // =============================================================================
 //  BATTERY WAKEUP — Low battery alert via tactile vibration
 // =============================================================================
 void handleBatteryWakeup() {
-    // TODO: read battery gauge over I2C (e.g. MAX17048) to confirm level
-    // For now, short vibration pulse to warn user
-    Serial.println("[BATTERY] Low battery warning.");
-     // Reuse vibration — distinguish by pattern later
+    Serial.println("[BATTERY] Low battery warning — waiting for charge.");
+
+    startAnimation(AnimMode::NEED_CHARGE);
+
+    pinMode(USB_DETECT_PIN, INPUT);
+
+    while (true) {
+        if (smsPendingInterrupt)
+            break;
+
+        bool usbDetected = digitalRead(USB_DETECT_PIN);
+        if (usbDetected) {
+            delay(50); // debounce only for USB pin
+            if (digitalRead(USB_DETECT_PIN))
+                break;
+        }
+
+        delay(100);
+    }
+
+    stopAnimation();
 }
 
 String sendAT(const String& cmd, uint32_t timeoutMs) {
@@ -1130,10 +1136,15 @@ static void animationTimerCallback(TimerHandle_t) {
             updateAnimationText("Connecting...", CENTER_X, CENTER_Y + 60);
             break;
 
-        case AnimMode::SPINNING_ARC:
+        case AnimMode::Initialization:
             uint16_t startAngle = (s_phase * 6) % 360;
-            s_sprite->drawArc(CENTER_X, CENTER_Y, 40, 34, startAngle, startAngle + 270, TFT_GREEN, TFT_BLACK);
-            updateAnimationText("Registering...", CENTER_X, CENTER_Y + 60);
+            uint16_t radius = 40 + (uint8_t)(6.0f * sinf(s_phase * 0.08f));
+            s_sprite->fillSprite(TFT_RED);
+            s_sprite->drawCircle(CENTER_X, CENTER_Y, radius,     TFT_WHITE);
+            s_sprite->drawCircle(CENTER_X, CENTER_Y, radius - 1, TFT_WHITE);
+            s_sprite->drawSmoothArc(120, 120, 100, 85, startAngle, startAngle + 270, TFT_WHITE, TFT_BLACK, true);
+            s_sprite->drawSmoothArc(120, 120, 85, 70, 180 - startAngle , 180 - (startAngle + 270), TFT_WHITE, TFT_BLACK, true);
+            updateAnimationText("מגדירים את המכשיר... כבר נתחיל", CENTER_X, CENTER_Y + 60);
             break;
     }
 
